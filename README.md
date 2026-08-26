@@ -1,2 +1,1144 @@
 # email-extractor-verifier
 Email extraction and verification application
+import csv
+import re
+import socket
+import threading
+import queue
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import dns.resolver
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+EMAIL_REGEX = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+
+SUPPORTED_FILES = {
+    ".txt",
+    ".csv",
+    ".html",
+    ".htm"
+}
+
+
+# ============================================================
+# EMAIL EXTRACTION
+# ============================================================
+
+def extract_emails(text):
+    """
+    Extract unique email addresses from text.
+    """
+    matches = EMAIL_REGEX.findall(text)
+
+    cleaned = set()
+
+    for email in matches:
+        email = email.lower().strip()
+
+        if EMAIL_REGEX.fullmatch(email):
+            cleaned.add(email)
+
+    return sorted(cleaned)
+
+
+def read_input_file(file_path):
+    """
+    Read TXT, CSV, HTML and HTM files.
+    """
+
+    path = Path(file_path)
+
+    if not path.exists():
+        raise FileNotFoundError(file_path)
+
+    extension = path.suffix.lower()
+
+    if extension not in SUPPORTED_FILES:
+        raise ValueError(
+            "Unsupported file format."
+        )
+
+    # --------------------------------------------------------
+    # TXT / HTML
+    # --------------------------------------------------------
+
+    if extension in [".txt", ".html", ".htm"]:
+
+        return path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
+
+    if extension == ".csv":
+
+        content = []
+
+        with open(
+            file_path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+            newline=""
+        ) as file:
+
+            reader = csv.reader(file)
+
+            for row in reader:
+
+                content.append(
+                    " ".join(row)
+                )
+
+        return "\n".join(content)
+
+    return ""
+
+
+# ============================================================
+# EMAIL VERIFICATION
+# ============================================================
+
+def validate_email_syntax(email):
+    """
+    Basic email syntax validation.
+    """
+
+    return bool(
+        EMAIL_REGEX.fullmatch(email)
+    )
+
+
+def check_domain(domain):
+    """
+    Check whether the domain has DNS.
+    """
+
+    try:
+
+        socket.gethostbyname(domain)
+
+        return True
+
+    except socket.gaierror:
+
+        return False
+
+
+def check_mx(domain):
+    """
+    Check MX records.
+    """
+
+    try:
+
+        answers = dns.resolver.resolve(
+            domain,
+            "MX",
+            lifetime=5
+        )
+
+        mx_records = []
+
+        for answer in answers:
+
+            mx_records.append(
+                str(answer.exchange).rstrip(".")
+            )
+
+        return True, mx_records
+
+    except (
+        dns.resolver.NXDOMAIN,
+        dns.resolver.NoAnswer,
+        dns.resolver.NoNameservers,
+        dns.resolver.Timeout,
+    ):
+
+        return False, []
+
+
+def verify_email(email):
+    """
+    Perform safe email verification.
+
+    This checks:
+    - Syntax
+    - DNS
+    - MX
+
+    It does NOT attempt SMTP mailbox probing.
+    """
+
+    result = {
+        "email": email,
+        "syntax": "Invalid",
+        "domain": "",
+        "domain_exists": "No",
+        "mx": "No",
+        "mx_records": "",
+        "status": "Invalid"
+    }
+
+    # --------------------------------------------------------
+    # Syntax
+    # --------------------------------------------------------
+
+    if not validate_email_syntax(email):
+
+        return result
+
+    result["syntax"] = "Valid"
+
+    # --------------------------------------------------------
+    # Domain
+    # --------------------------------------------------------
+
+    domain = email.split("@", 1)[1].lower()
+
+    result["domain"] = domain
+
+    domain_exists = check_domain(domain)
+
+    result["domain_exists"] = (
+        "Yes"
+        if domain_exists
+        else "No"
+    )
+
+    # --------------------------------------------------------
+    # MX
+    # --------------------------------------------------------
+
+    mx_exists, mx_records = check_mx(domain)
+
+    result["mx"] = (
+        "Yes"
+        if mx_exists
+        else "No"
+    )
+
+    result["mx_records"] = ", ".join(
+        mx_records
+    )
+
+    # --------------------------------------------------------
+    # Status
+    # --------------------------------------------------------
+
+    if mx_exists:
+
+        result["status"] = "MX Valid"
+
+    elif domain_exists:
+
+        result["status"] = "No MX"
+
+    else:
+
+        result["status"] = "Invalid Domain"
+
+    return result
+
+
+# ============================================================
+# GUI APPLICATION
+# ============================================================
+
+class EmailVerifierApp:
+
+    def __init__(self, root):
+
+        self.root = root
+
+        self.root.title(
+            "Email Extractor & Verifier"
+        )
+
+        self.root.geometry(
+            "1200x700"
+        )
+
+        self.root.minsize(
+            950,
+            600
+        )
+
+        # ----------------------------------------------------
+        # DATA
+        # ----------------------------------------------------
+
+        self.results = []
+
+        self.email_list = []
+
+        self.worker_thread = None
+
+        self.stop_event = threading.Event()
+
+        self.message_queue = queue.Queue()
+
+        # ----------------------------------------------------
+        # VARIABLES
+        # ----------------------------------------------------
+
+        self.status_filter = tk.StringVar(
+            value="All"
+        )
+
+        self.progress_var = tk.DoubleVar(
+            value=0
+        )
+
+        self.status_var = tk.StringVar(
+            value="Ready"
+        )
+
+        # ----------------------------------------------------
+        # BUILD UI
+        # ----------------------------------------------------
+
+        self.build_ui()
+
+        # ----------------------------------------------------
+        # Queue processor
+        # ----------------------------------------------------
+
+        self.root.after(
+            100,
+            self.process_queue
+        )
+
+    # ========================================================
+    # BUILD UI
+    # ========================================================
+
+    def build_ui(self):
+
+        # ----------------------------------------------------
+        # HEADER
+        # ----------------------------------------------------
+
+        header = ttk.Frame(
+            self.root,
+            padding=15
+        )
+
+        header.pack(
+            fill="x"
+        )
+
+        title = ttk.Label(
+            header,
+            text="Email Extractor & Verifier",
+            font=("Arial", 20, "bold")
+        )
+
+        title.pack(
+            side="left"
+        )
+
+        # ----------------------------------------------------
+        # CONTROL BAR
+        # ----------------------------------------------------
+
+        controls = ttk.Frame(
+            self.root,
+            padding=(15, 5)
+        )
+
+        controls.pack(
+            fill="x"
+        )
+
+        self.upload_button = ttk.Button(
+            controls,
+            text="Upload File",
+            command=self.upload_file
+        )
+
+        self.upload_button.pack(
+            side="left",
+            padx=5
+        )
+
+        self.verify_button = ttk.Button(
+            controls,
+            text="Start Verification",
+            command=self.start_verification
+        )
+
+        self.verify_button.pack(
+            side="left",
+            padx=5
+        )
+
+        self.stop_button = ttk.Button(
+            controls,
+            text="Stop",
+            command=self.stop_verification,
+            state="disabled"
+        )
+
+        self.stop_button.pack(
+            side="left",
+            padx=5
+        )
+
+        self.export_button = ttk.Button(
+            controls,
+            text="Export CSV",
+            command=self.export_csv
+        )
+
+        self.export_button.pack(
+            side="left",
+            padx=5
+        )
+
+        # ----------------------------------------------------
+        # FILTER
+        # ----------------------------------------------------
+
+        ttk.Label(
+            controls,
+            text="Filter:"
+        ).pack(
+            side="left",
+            padx=(30, 5)
+        )
+
+        self.filter_combo = ttk.Combobox(
+            controls,
+            textvariable=self.status_filter,
+            values=[
+                "All",
+                "MX Valid",
+                "No MX",
+                "Invalid Domain",
+                "Invalid"
+            ],
+            state="readonly",
+            width=18
+        )
+
+        self.filter_combo.pack(
+            side="left"
+        )
+
+        self.filter_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self.refresh_table()
+        )
+
+        # ----------------------------------------------------
+        # PROGRESS
+        # ----------------------------------------------------
+
+        progress_frame = ttk.Frame(
+            self.root,
+            padding=(15, 10)
+        )
+
+        progress_frame.pack(
+            fill="x"
+        )
+
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.progress_var,
+            maximum=100
+        )
+
+        self.progress_bar.pack(
+            fill="x"
+        )
+
+        ttk.Label(
+            progress_frame,
+            textvariable=self.status_var
+        ).pack(
+            anchor="w",
+            pady=(5, 0)
+        )
+
+        # ----------------------------------------------------
+        # STATISTICS
+        # ----------------------------------------------------
+
+        stats = ttk.Frame(
+            self.root,
+            padding=10
+        )
+
+        stats.pack(
+            fill="x"
+        )
+
+        self.total_label = self.create_stat(
+            stats,
+            "Total",
+            0
+        )
+
+        self.mx_label = self.create_stat(
+            stats,
+            "MX Valid",
+            0
+        )
+
+        self.no_mx_label = self.create_stat(
+            stats,
+            "No MX",
+            0
+        )
+
+        self.invalid_label = self.create_stat(
+            stats,
+            "Invalid",
+            0
+        )
+
+        # ----------------------------------------------------
+        # TABLE
+        # ----------------------------------------------------
+
+        table_frame = ttk.Frame(
+            self.root,
+            padding=10
+        )
+
+        table_frame.pack(
+            fill="both",
+            expand=True
+        )
+
+        columns = (
+            "email",
+            "syntax",
+            "domain",
+            "domain_exists",
+            "mx",
+            "status"
+        )
+
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings"
+        )
+
+        self.tree.heading(
+            "email",
+            text="Email"
+        )
+
+        self.tree.heading(
+            "syntax",
+            text="Syntax"
+        )
+
+        self.tree.heading(
+            "domain",
+            text="Domain"
+        )
+
+        self.tree.heading(
+            "domain_exists",
+            text="Domain Exists"
+        )
+
+        self.tree.heading(
+            "mx",
+            text="MX"
+        )
+
+        self.tree.heading(
+            "status",
+            text="Status"
+        )
+
+        self.tree.column(
+            "email",
+            width=300
+        )
+
+        self.tree.column(
+            "syntax",
+            width=100
+        )
+
+        self.tree.column(
+            "domain",
+            width=220
+        )
+
+        self.tree.column(
+            "domain_exists",
+            width=130
+        )
+
+        self.tree.column(
+            "mx",
+            width=80
+        )
+
+        self.tree.column(
+            "status",
+            width=150
+        )
+
+        scrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.tree.yview
+        )
+
+        self.tree.configure(
+            yscrollcommand=scrollbar.set
+        )
+
+        self.tree.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        scrollbar.pack(
+            side="right",
+            fill="y"
+        )
+
+    # ========================================================
+    # STAT BOX
+    # ========================================================
+
+    def create_stat(
+        self,
+        parent,
+        title,
+        value
+    ):
+
+        frame = ttk.LabelFrame(
+            parent,
+            text=title,
+            padding=10
+        )
+
+        frame.pack(
+            side="left",
+            padx=5,
+            fill="x",
+            expand=True
+        )
+
+        label = ttk.Label(
+            frame,
+            text=str(value),
+            font=("Arial", 14, "bold")
+        )
+
+        label.pack()
+
+        return label
+
+    # ========================================================
+    # UPLOAD
+    # ========================================================
+
+    def upload_file(self):
+
+        file_path = filedialog.askopenfilename(
+            title="Select Email File",
+            filetypes=[
+                (
+                    "Supported files",
+                    "*.txt *.csv *.html *.htm"
+                ),
+                (
+                    "Text files",
+                    "*.txt"
+                ),
+                (
+                    "CSV files",
+                    "*.csv"
+                ),
+                (
+                    "HTML files",
+                    "*.html *.htm"
+                ),
+                (
+                    "All files",
+                    "*.*"
+                )
+            ]
+        )
+
+        if not file_path:
+            return
+
+        try:
+
+            self.status_var.set(
+                "Reading file..."
+            )
+
+            text = read_input_file(
+                file_path
+            )
+
+            emails = extract_emails(
+                text
+            )
+
+            if not emails:
+
+                messagebox.showinfo(
+                    "No Emails",
+                    "No email addresses were found."
+                )
+
+                return
+
+            self.email_list = emails
+
+            self.results = []
+
+            self.progress_var.set(
+                0
+            )
+
+            self.refresh_table()
+
+            self.update_statistics()
+
+            self.status_var.set(
+                f"Loaded {len(emails)} unique email addresses."
+            )
+
+        except Exception as error:
+
+            messagebox.showerror(
+                "Error",
+                str(error)
+            )
+
+    # ========================================================
+    # START VERIFICATION
+    # ========================================================
+
+    def start_verification(self):
+
+        if not self.email_list:
+
+            messagebox.showwarning(
+                "No Emails",
+                "Please upload a file first."
+            )
+
+            return
+
+        if (
+            self.worker_thread
+            and self.worker_thread.is_alive()
+        ):
+
+            return
+
+        self.results = []
+
+        self.stop_event.clear()
+
+        self.progress_var.set(
+            0
+        )
+
+        self.verify_button.config(
+            state="disabled"
+        )
+
+        self.upload_button.config(
+            state="disabled"
+        )
+
+        self.stop_button.config(
+            state="normal"
+        )
+
+        self.status_var.set(
+            "Verification started..."
+        )
+
+        self.worker_thread = threading.Thread(
+            target=self.verification_worker,
+            daemon=True
+        )
+
+        self.worker_thread.start()
+
+    # ========================================================
+    # WORKER THREAD
+    # ========================================================
+
+    def verification_worker(self):
+
+        total = len(
+            self.email_list
+        )
+
+        for index, email in enumerate(
+            self.email_list,
+            start=1
+        ):
+
+            if self.stop_event.is_set():
+
+                self.message_queue.put(
+                    ("stopped", None)
+                )
+
+                return
+
+            result = verify_email(
+                email
+            )
+
+            self.message_queue.put(
+                ("result", result)
+            )
+
+            progress = (
+                index / total
+            ) * 100
+
+            self.message_queue.put(
+                (
+                    "progress",
+                    (
+                        progress,
+                        index,
+                        total,
+                        email
+                    )
+                )
+            )
+
+        self.message_queue.put(
+            ("finished", None)
+        )
+
+    # ========================================================
+    # STOP
+    # ========================================================
+
+    def stop_verification(self):
+
+        self.stop_event.set()
+
+        self.status_var.set(
+            "Stopping verification..."
+        )
+
+        self.stop_button.config(
+            state="disabled"
+        )
+
+    # ========================================================
+    # QUEUE
+    # ========================================================
+
+    def process_queue(self):
+
+        try:
+
+            while True:
+
+                message_type, data = (
+                    self.message_queue.get_nowait()
+                )
+
+                if message_type == "result":
+
+                    self.results.append(
+                        data
+                    )
+
+                    self.refresh_table()
+
+                    self.update_statistics()
+
+                elif message_type == "progress":
+
+                    progress, index, total, email = data
+
+                    self.progress_var.set(
+                        progress
+                    )
+
+                    self.status_var.set(
+                        f"Checking {index}/{total}: {email}"
+                    )
+
+                elif message_type == "finished":
+
+                    self.verification_finished()
+
+                elif message_type == "stopped":
+
+                    self.verification_stopped()
+
+        except queue.Empty:
+
+            pass
+
+        self.root.after(
+            100,
+            self.process_queue
+        )
+
+    # ========================================================
+    # FINISHED
+    # ========================================================
+
+    def verification_finished(self):
+
+        self.progress_var.set(
+            100
+        )
+
+        self.status_var.set(
+            "Verification completed."
+        )
+
+        self.verify_button.config(
+            state="normal"
+        )
+
+        self.upload_button.config(
+            state="normal"
+        )
+
+        self.stop_button.config(
+            state="disabled"
+        )
+
+        self.update_statistics()
+
+    # ========================================================
+    # STOPPED
+    # ========================================================
+
+    def verification_stopped(self):
+
+        self.status_var.set(
+            "Verification stopped."
+        )
+
+        self.verify_button.config(
+            state="normal"
+        )
+
+        self.upload_button.config(
+            state="normal"
+        )
+
+        self.stop_button.config(
+            state="disabled"
+        )
+
+    # ========================================================
+    # TABLE
+    # ========================================================
+
+    def refresh_table(self):
+
+        for item in self.tree.get_children():
+
+            self.tree.delete(
+                item
+            )
+
+        selected_filter = (
+            self.status_filter.get()
+        )
+
+        for result in self.results:
+
+            if (
+                selected_filter != "All"
+                and result["status"] != selected_filter
+            ):
+
+                continue
+
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    result["email"],
+                    result["syntax"],
+                    result["domain"],
+                    result["domain_exists"],
+                    result["mx"],
+                    result["status"]
+                )
+            )
+
+    # ========================================================
+    # STATISTICS
+    # ========================================================
+
+    def update_statistics(self):
+
+        total = len(
+            self.email_list
+        )
+
+        mx_valid = sum(
+            1
+            for result in self.results
+            if result["status"] == "MX Valid"
+        )
+
+        no_mx = sum(
+            1
+            for result in self.results
+            if result["status"] == "No MX"
+        )
+
+        invalid = sum(
+            1
+            for result in self.results
+            if result["status"] in [
+                "Invalid",
+                "Invalid Domain"
+            ]
+        )
+
+        self.total_label.config(
+            text=str(total)
+        )
+
+        self.mx_label.config(
+            text=str(mx_valid)
+        )
+
+        self.no_mx_label.config(
+            text=str(no_mx)
+        )
+
+        self.invalid_label.config(
+            text=str(invalid)
+        )
+
+    # ========================================================
+    # EXPORT CSV
+    # ========================================================
+
+    def export_csv(self):
+
+        if not self.results:
+
+            messagebox.showwarning(
+                "Nothing to Export",
+                "There are no verification results."
+            )
+
+            return
+
+        output_file = filedialog.asksaveasfilename(
+            title="Export Results",
+            defaultextension=".csv",
+            filetypes=[
+                (
+                    "CSV files",
+                    "*.csv"
+                )
+            ]
+        )
+
+        if not output_file:
+            return
+
+        try:
+
+            with open(
+                output_file,
+                "w",
+                encoding="utf-8",
+                newline=""
+            ) as file:
+
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=[
+                        "email",
+                        "syntax",
+                        "domain",
+                        "domain_exists",
+                        "mx",
+                        "mx_records",
+                        "status"
+                    ]
+                )
+
+                writer.writeheader()
+
+                writer.writerows(
+                    self.results
+                )
+
+            messagebox.showinfo(
+                "Export Complete",
+                f"Results exported successfully:\n\n{output_file}"
+            )
+
+        except Exception as error:
+
+            messagebox.showerror(
+                "Export Error",
+                str(error)
+            )
+
+
+# ============================================================
+# APPLICATION START
+# ============================================================
+
+def main():
+
+    root = tk.Tk()
+
+    try:
+
+        style = ttk.Style()
+
+        if "vista" in style.theme_names():
+
+            style.theme_use("vista")
+
+    except Exception:
+        pass
+
+    app = EmailVerifierApp(
+        root
+    )
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
