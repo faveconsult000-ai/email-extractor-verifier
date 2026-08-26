@@ -1,4 +1,4 @@
-# email-extractor-verifier
+email_verifier_gui.py
 Email extraction and verification application
 import csv
 import re
